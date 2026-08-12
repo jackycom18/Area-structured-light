@@ -19,7 +19,7 @@ polyOrder  = 3;              % 多项式阶数 (3阶推荐, 论文标准)
 minSamples = 5;              % 最少需要几个位置的数据才拟合
 
 % 加载相机内参
-load(fullfile(sprintf(dataBase,1), 'pixel_to_projector_mapping.mat'), 'K');
+load(fullfile(sprintf(dataBase,1), 'pixel_to_projector_mapping.mat'), 'K', 'camUVund');
 [imgH, imgW] = deal(0, 0);  % 稍后从数据确定
 
 %% ======================== 收集数据: 逐像素 (col, Zc) ========================
@@ -238,4 +238,5 @@ fprintf('\n使用时:\n');
 fprintf('  1. 对像素 (u,v)，解码得到投影仪列号 col\n');
 fprintf('  2. p = squeeze(coeffs(v,u,:));\n');
 fprintf('  3. Zc = polyval(p, col);\n');
-fprintf('  4. Xc = (u-K(1,3))*Zc/K(1,1);  Yc = (v-K(2,3))*Zc/K(2,2);\n');
+fprintf('  4. 用去畸变坐标 (u_und,v_und)（relationship_mapping 输出的 camUVund）计算 X/Y:\n');
+fprintf('     Xc = (u_und-K(1,3))*Zc/K(1,1);  Yc = (v_und-K(2,3))*Zc/K(2,2);\n');

@@ -54,21 +54,20 @@ fprintf('\n有效视角数: %d\n', numViews);
 if numViews < 3
     error('至少需要 3 个有效视角才能求解内参');
 end
+%% ======================== 标定内参与畸变系数（张正友法） ========================
+% 使用 MATLAB 自带 estimateCameraParameters：
+%   内部完成 DLT 单应 + 闭式解 + LM 非线性优化，直接输出 K 与畸变系数
+fprintf('\n标定内参 K 与畸变系数...\n');
 
-%% ======================== 步骤1：计算各视角的单应性矩阵 H ========================
-fprintf('\n计算单应性矩阵...\n');
+imagePoints = cat(3, allImagePts{:});   % Mx2xN，所有视角的角点
+worldPts2D  = worldPts(:, 1:2);         % 棋盘格平面 Z=0，只取 X,Y
 
-H_cell = cell(1, numViews);
-worldPts2D = worldPts(:, 1:2);  % 只取 X,Y（Z=0）
+[cameraParams, ~, estimationErrors] = estimateCameraParameters(imagePoints, worldPts2D);
 
-for v = 1:numViews
-    H_cell{v} = computeHomography(worldPts2D, allImagePts{v});
-end
-
-%% ======================== 步骤2：闭式解求解内参矩阵 K ========================
-fprintf('求解内参矩阵...\n');
-
-K = solveIntrinsics(H_cell);
+K = cameraParams.IntrinsicMatrix';      % MATLAB 内参矩阵按转置存储
+k = cameraParams.RadialDistortion;      % 径向畸变 [k1 k2 k3]
+p = cameraParams.TangentialDistortion;  % 切向畸变 [p1 p2]
+meanError = estimationErrors.MeanReprojectionError;
 
 fprintf('\n========== 内参矩阵 K ==========\n');
 fprintf('  fx = %.4f  (焦距 x 方向，像素)\n', K(1,1));
@@ -78,136 +77,15 @@ fprintf('  cy = %.4f  (主点 y 坐标，像素)\n', K(2,3));
 fprintf('  s  = %.4f  (倾斜因子)\n', K(1,2));
 fprintf('\n内参矩阵:\n');
 disp(K);
+fprintf('\n========== 畸变系数 ==========\n');
+fprintf('  径向畸变 k = [%.6f, %.6f, %.6f]\n', k(1), k(2), k(3));
+fprintf('  切向畸变 p = [%.6f, %.6f]\n', p(1), p(2));
 
-%% ======================== 步骤3：评估重投影误差 ========================
-fprintf('计算重投影误差...\n');
-
-totalError = 0;
-totalPts = 0;
-errors_per_view = zeros(1, numViews);
-
-for v = 1:numViews
-    % 用当前单应性（等价于外参已知）计算重投影
-    H = H_cell{v};
-    projPts = (K * (K \ [worldPts2D, ones(size(worldPts2D,1),1)]'))';  % 近似
-    
-    % 更精确的重投影：用 H 直接映射
-    worldHomog = [worldPts2D, ones(size(worldPts2D,1),1)];
-    projHomog = (H * worldHomog')';
-    projPts = projHomog(:, 1:2) ./ projHomog(:, 3);
-    
-    errors = sqrt(sum((allImagePts{v} - projPts).^2, 2));
-    errors_per_view(v) = mean(errors);
-    totalError = totalError + sum(errors);
-    totalPts = totalPts + length(errors);
-end
-
-meanError = totalError / totalPts;
-
+%% ======================== 重投影误差 ========================
 fprintf('\n========== 重投影误差 ==========\n');
-fprintf('平均误差: %.4f 像素\n', meanError);
-fprintf('各视角误差:\n');
-for v = 1:numViews
-    fprintf('  视角 %2d: %.4f 像素\n', v, errors_per_view(v));
-end
+fprintf('  平均误差: %.4f 像素\n', meanError);
 
-%% ======================== 保存内参 ========================
-save('camera_intrinsics.mat', 'K');
-fprintf('\n内参矩阵 K 已保存至 camera_intrinsics.mat\n');
-
-% =========================================================================
-%                         辅助函数
-% =========================================================================
-
-%% 函数：计算单应性矩阵 H (DLT 方法)
-function H = computeHomography(worldPts, imagePts)
-    % 使用直接线性变换 (DLT) 计算单应性矩阵
-    % 输入：
-    %   worldPts - Nx2 世界坐标（Z=0 平面）
-    %   imagePts - Nx2 图像坐标
-    % 输出：
-    %   H - 3x3 单应性矩阵
-    
-    N = size(worldPts, 1);
-    
-    % 构建线性方程组 A*h = 0
-    A = zeros(2*N, 9);
-    for i = 1:N
-        X = worldPts(i, 1);
-        Y = worldPts(i, 2);
-        u = imagePts(i, 1);
-        v = imagePts(i, 2);
-        
-        A(2*i-1, :) = [X, Y, 1, 0, 0, 0, -u*X, -u*Y, -u];
-        A(2*i,   :) = [0, 0, 0, X, Y, 1, -v*X, -v*Y, -v];
-    end
-    
-    % SVD 分解，取最小奇异值对应的向量
-    [~, ~, V] = svd(A);
-    h = V(:, 9);
-    
-    % 重塑为 3x3 矩阵
-    H = reshape(h, [3, 3])';
-    
-    % 归一化（使 H(3,3) ≈ 1）
-    H = H / H(3,3);
-end
-
-%% 函数：闭式解求解内参矩阵 K
-function K = solveIntrinsics(H_cell)
-    % 使用张正友方法求解内参矩阵
-    % 利用旋转矩阵列向量正交约束：h1'*B*h2 = 0, h1'*B*h1 = h2'*B*h2
-    % 其中 B = K^(-T) * K^(-1)
-    
-    numViews = length(H_cell);
-    
-    % 构建关于 b 的线性方程组 V * b = 0
-    % b = [B11, B12, B22, B13, B23, B33]'
-    V = zeros(2*numViews, 6);
-    
-    for v = 1:numViews
-        H = H_cell{v};
-        h1 = H(:, 1);
-        h2 = H(:, 2);
-        
-        % v12 = [h1*h2 关于 b 的系数]
-        v12 = [h1(1)*h2(1), ...
-               h1(1)*h2(2) + h1(2)*h2(1), ...
-               h1(2)*h2(2), ...
-               h1(3)*h2(1) + h1(1)*h2(3), ...
-               h1(3)*h2(2) + h1(2)*h2(3), ...
-               h1(3)*h2(3)];
-        
-        % v11 - v22 = [h1*h1 - h2*h2 关于 b 的系数]
-        v11_v22 = [h1(1)^2 - h2(1)^2, ...
-                   2*(h1(1)*h1(2) - h2(1)*h2(2)), ...
-                   h1(2)^2 - h2(2)^2, ...
-                   2*(h1(3)*h1(1) - h2(3)*h2(1)), ...
-                   2*(h1(3)*h1(2) - h2(3)*h2(2)), ...
-                   h1(3)^2 - h2(3)^2];
-        
-        V(2*v-1, :) = v12;
-        V(2*v,   :) = v11_v22;
-    end
-    
-    % SVD 求解 V * b = 0
-    [~, ~, Vt] = svd(V);
-    b = Vt(:, 6);
-    
-    % 从 b 提取 B 矩阵元素
-    B11 = b(1); B12 = b(2); B22 = b(3);
-    B13 = b(4); B23 = b(5); B33 = b(6);
-    
-    % 从 B 计算内参
-    v0 = (B12*B13 - B11*B23) / (B11*B22 - B12^2);
-    lambda = B33 - (B13^2 + v0*(B12*B13 - B11*B23)) / B11;
-    alpha = sqrt(lambda / B11);
-    beta  = sqrt(lambda * B11 / (B11*B22 - B12^2));
-    gamma = -B12 * alpha^2 * beta / lambda;
-    u0 = gamma * v0 / beta - B13 * alpha^2 / lambda;
-    
-    % 构建内参矩阵
-    K = [alpha, gamma, u0;
-         0,     beta,  v0;
-         0,     0,     1];
-end
+%% ======================== 保存内参与畸变 ========================
+save('camera_intrinsics.mat', 'K', 'k', 'p', 'cameraParams');
+fprintf('\n内参 K、畸变系数 k/p、cameraParams 已保存至 camera_intrinsics.mat\n');
+fprintf('后续 relationship_mapping.m 将用 cameraParams 对像素坐标去畸变\n');

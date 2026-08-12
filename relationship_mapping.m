@@ -30,6 +30,11 @@ fprintf('加载相机内参...\n');
 if exist('camera_intrinsics.mat', 'file')
     Kdata = load('camera_intrinsics.mat');
     K = Kdata.K;
+    if isfield(Kdata, 'cameraParams')
+        cameraParams = Kdata.cameraParams;   % 含畸变系数，用于去畸变
+    else
+        cameraParams = [];                    % 旧标定文件，跳过畸变校正
+    end
 else
     error('未找到 camera_intrinsics.mat，请先运行 neican.m');
 end
@@ -53,7 +58,12 @@ else
 end
 
 % 检测棋盘格角点
-[imagePts, boardSizeDetected] = detectCheckerboardPoints(boardGray);
+[imagePtsRaw, boardSizeDetected] = detectCheckerboardPoints(boardGray);
+if ~isempty(cameraParams)
+    imagePts = undistortPoints(imagePtsRaw, cameraParams);   % 去畸变角点用于解外参
+else
+    imagePts = imagePtsRaw;
+end
 
 if size(imagePts, 1) ~= numRows * numCols
     warning('检测到 %d 个角点，期望 %d 个。请检查棋盘格参数。', ...
@@ -112,10 +122,10 @@ disp(t);
 
 % 构建棋盘格角点凸包掩码
 cornerPoly = [
-    imagePts(1, :);                          % 左上
-    imagePts(numCols, :);                    % 右上
-    imagePts(end, :);                        % 右下
-    imagePts(end - numCols + 1, :)           % 左下
+    imagePtsRaw(1, :);                          % 左上
+    imagePtsRaw(numCols, :);                    % 右上
+    imagePtsRaw(end, :);                        % 右下
+    imagePtsRaw(end - numCols + 1, :)           % 左下
 ];
 
 % 略微收缩边界（向内缩5像素，避免包含棋盘格边缘外的背景）
@@ -176,14 +186,19 @@ fprintf('  待求交点: %d 个像素\n', nPts);
 % 预分配
 worldXYZ = zeros(nPts, 3);
 projCols  = zeros(nPts, 1);
-camUV     = [validCols, validRows];
+camUV     = [validCols, validRows];   % 原始像素坐标
+if ~isempty(cameraParams)
+    camUVund = undistortPoints(camUV, cameraParams);   % 去畸变后的理想像素坐标
+else
+    camUVund = camUV;
+end
 
 % 批量计算
 ndott = n_c' * t_c;
 
 for i = 1:nPts
-    u = validCols(i);
-    v = validRows(i);
+    u = camUVund(i, 1);   % 去畸变坐标（x 方向）
+    v = camUVund(i, 2);   % 去畸变坐标（y 方向）
     
     % 射线方向（相机坐标系）
     d = Kinv * [u; v; 1];
@@ -206,14 +221,15 @@ for i = 1:nPts
     P_w = Rmat' * (P_c - t_c);
     
     worldXYZ(i, :) = P_w';
-    projCols(i)    = absColumn(v, u);
+    projCols(i)    = absColumn(validRows(i), validCols(i));   % 相位图按原始像素索引
 end
 
 % 移除未计算成功的点（projCols 仍为 0）
 validIdx = projCols > 0;
 worldXYZ  = worldXYZ(validIdx, :);
 projCols  = projCols(validIdx);
-camUV     = camUV(validIdx, :);
+camUV     = camUV(validIdx, :);       % 映射表保留原始像素坐标（project.m 用作索引）
+camUVund  = camUVund(validIdx, :);   % 去畸变坐标另存，供 Xc/Yc 使用
 nPtsValid = sum(validIdx);
 
 fprintf('  有效交点: %d 个\n', nPtsValid);
@@ -229,7 +245,7 @@ worldHomog = [worldXYZ, ones(nPtsValid, 1)];
 projHomog  = (K * (Rmat * worldHomog(:,1:3)' + t_c))';
 projPts    = projHomog(:, 1:2) ./ projHomog(:, 3);
 
-reprojErrors = sqrt(sum((projPts - camUV).^2, 2));
+reprojErrors = sqrt(sum((projPts - camUVund).^2, 2));   % 与去畸变坐标对比
 meanReprojErr = mean(reprojErrors);
 maxReprojErr  = max(reprojErrors);
 
@@ -241,7 +257,7 @@ figure('Name', '映射关系可视化', 'Position', [50, 50, 1500, 700]);
 % (1) 标定板原图 + 检测角点
 subplot(2, 3, 1);
 imshow(boardGray); hold on;
-plot(imagePts(:,1), imagePts(:,2), 'r+', 'MarkerSize', 8);
+plot(imagePtsRaw(:,1), imagePtsRaw(:,2), 'r+', 'MarkerSize', 8);
 plot(cornerPoly([1:end,1], 1), cornerPoly([1:end,1], 2), 'g-', 'LineWidth', 2);
 title('标定板 + 棋盘格角点');
 
@@ -299,7 +315,7 @@ mappingTable = table(camUV(:,1), camUV(:,2), ...
     worldXYZ(:,1), worldXYZ(:,2), worldXYZ(:,3), projCols, ...
     'VariableNames', {'u_px', 'v_px', 'X_mm', 'Y_mm', 'Z_mm', 'projector_col'});
 
-save('pixel_to_projector_mapping.mat', 'mappingTable', 'camUV', 'worldXYZ', ...
+save('pixel_to_projector_mapping.mat', 'mappingTable', 'camUV', 'camUVund', 'worldXYZ', ...
     'projCols', 'finalMask', 'reprojErrors', 'Rmat', 't_c', 'K');
 fprintf('\n映射表已保存至 pixel_to_projector_mapping.mat\n');
 fprintf('  映射表变量 mappingTable: %d 行 × 6 列\n', nPtsValid);
