@@ -339,7 +339,6 @@ function [R, t, history] = pointToPlaneICP(source, target, varargin)
     % 初始化
     R = eye(3);
     t = [0, 0, 0];
-    prevError = inf;
     
     % 历史记录
     history.RMSE = [];
@@ -447,25 +446,14 @@ function [R, t, history] = pointToPlaneICP(source, target, varargin)
             validDist = validDist(keepIdx);
         end
         
-        % 3. 计算当前 RMSE
+        % 3. 计算当前 RMSE（仅记录，不用于收敛判断）
         currentRMSE = sqrt(mean(validDist.^2));
-        deltaError = abs(prevError - currentRMSE);
-        
-        if verbose
-            fprintf('  %-6d %-14.6f %-14.6f\n', iter, currentRMSE, deltaError);
-        end
-        
         history.RMSE = [history.RMSE; currentRMSE];
         
-        % 收敛判断
-        if deltaError < tol
-            if verbose
-                fprintf('  ICP 收敛于第 %d 次迭代。\n', iter);
-            end
-            break;
-        end
-        prevError = currentRMSE;
+        if verbose
+            fprintf('  %-6d %-14.6f\n', iter, currentRMSE);
         
+        end
         % 4. 构建点到面的线性系统并求解
         %    对于每个对应点对 (s_i, d_i, n_i)：
         %    最小化 Σ||(R·s_i + t - d_i)·n_i||²
@@ -482,6 +470,9 @@ function [R, t, history] = pointToPlaneICP(source, target, varargin)
         
         nPts = size(validSrc, 1);
         A = zeros(nPts, 6);  % [α_x, α_y, α_z, t_x, t_y, t_z]
+
+        % 鲁棒核尺度：取对应点距离的中位数（Cauchy 核）
+        sigma = max(median(validDist), 1e-6);
         b = zeros(nPts, 1);
         
         for i = 1:nPts
@@ -489,8 +480,8 @@ function [R, t, history] = pointToPlaneICP(source, target, varargin)
             di = validTgt(i, :)';
             ni = validNrm(i, :)';
             
-            % 权重：与点对距离成反比（距离越近权重越大）
-            wi = 1 / (validDist(i) + 1e-8);
+            % 权重：Cauchy 鲁棒核，抑制大距离/噪声点对解的支配
+            wi = 1 / (1 + (validDist(i) / sigma)^2);
             
             % s_i × n_i  (叉积)
             crossProd = cross(si, ni);
@@ -506,6 +497,11 @@ function [R, t, history] = pointToPlaneICP(source, target, varargin)
         
         alpha = x(1:3);  % 旋转增量（小角度）
         dt    = x(4:6)'; % 平移增量
+
+        % 大旋转警告：小角度线性化假设失效
+        if norm(alpha) > deg2rad(5)
+            warning('点面ICP：单步旋转增量 %.1f°，超出小角度线性化假设，结果可能不可靠。', rad2deg(norm(alpha)));
+        end
         
         % 5. 将小角度旋转向量转换为旋转矩阵（Rodrigues 公式）
         dR = rotationVectorToMatrix(alpha);
@@ -517,8 +513,15 @@ function [R, t, history] = pointToPlaneICP(source, target, varargin)
         % 7. 更新源点云位置
         sourceTransformed = (dR * sourceTransformed' + dt')';
         
-        % 记录变换变化量
-        history.TransformChange = [history.TransformChange; norm(alpha) + norm(dt)];
+        % 5. 收敛判断：变换变化量（比 RMSE 变化更可靠）
+        deltaTransform = norm(alpha) + norm(dt);
+        history.TransformChange = [history.TransformChange; deltaTransform];
+        if deltaTransform < tol
+            if verbose
+                fprintf('  ICP 收敛于第 %d 次迭代（变换变化量 %.3e）。\n', iter, deltaTransform);
+            end
+            break;
+        end
     end
     
     if verbose && iter == maxIter
